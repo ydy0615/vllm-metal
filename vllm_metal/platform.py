@@ -731,6 +731,28 @@ class MetalPlatform(Platform):
             if model_config is not None
             else None
         )
+        from vllm_metal.modilify.detection import is_modilify_model
+
+        if resolved_model is not None and is_modilify_model(resolved_model):
+            if parallel_config.pipeline_parallel_size > 1:
+                raise NotImplementedError(
+                    "Pipeline parallelism is not supported for Modilify models."
+                )
+            if parallel_config.data_parallel_size > 1:
+                raise NotImplementedError(
+                    "Data parallelism is not supported for Modilify models."
+                )
+            if vllm_config.speculative_config is not None:
+                raise NotImplementedError(
+                    "Speculative decoding is not supported for Modilify models."
+                )
+            if not model_config.tokenizer:
+                model_config.tokenizer = model_config.model
+            if scheduler_config.async_scheduling:
+                scheduler_config.async_scheduling = False
+                logger.info("Modilify: disabled async_scheduling")
+            logger.info("Modilify model detected")
+
         if resolved_model is not None and is_stt_model(resolved_model):
             # STT checkpoints use a dedicated STTModelRunner with no pipeline-
             # split path. Reject PP here, with the other config-time PP guards,

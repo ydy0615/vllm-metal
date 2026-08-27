@@ -70,8 +70,8 @@ class MetalWorker(WorkerBase):
     """
 
     # Override model_runner type from base class. Typed as MetalModelRunner
-    # because its worker-facing method set is a superset of STTModelRunner's;
-    # STT models are assigned an STTModelRunner at runtime (see init_device).
+    # because its worker-facing method set is a superset of STT/Modilify
+    # runners; those checkpoints pick a dedicated runner in init_device.
     model_runner: MetalModelRunner  # type: ignore[assignment]
 
     def __init__(
@@ -174,13 +174,22 @@ class MetalWorker(WorkerBase):
         # generation runner's machinery, so they use a dedicated runner. Detect
         # here using the same predicate as the generation load path and pick the
         # runner before construction. Imports are local to avoid circular imports.
+        from vllm_metal.modilify.detection import is_modilify_model
         from vllm_metal.stt.detection import is_stt_model
         from vllm_metal.utils import get_model_download_path
 
-        if is_stt_model(get_model_download_path(self.model_config.model)):
+        model_path = get_model_download_path(self.model_config.model)
+        if is_stt_model(model_path):
             from vllm_metal.v1.stt_model_runner import STTModelRunner
 
             self.model_runner = STTModelRunner(
+                vllm_config=self.vllm_config,
+                device=self.device,
+            )
+        elif is_modilify_model(model_path):
+            from vllm_metal.v1.modilify_model_runner import ModilifyModelRunner
+
+            self.model_runner = ModilifyModelRunner(
                 vllm_config=self.vllm_config,
                 device=self.device,
             )

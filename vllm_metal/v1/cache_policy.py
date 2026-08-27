@@ -1149,6 +1149,13 @@ class WorkerCachePlanner:
             logger.info("STT model: reporting nominal memory for scheduler")
             return STT_SCHED_AVAILABLE_BYTES
 
+        if mode == "modilify_internal":
+            logger.info(
+                "Modilify: reporting nominal scheduler memory "
+                "(prefix KV is owned by the diffusion runner)"
+            )
+            return STT_SCHED_AVAILABLE_BYTES
+
         if mode == "paged_attention_capacity":
             overhead = self._worker.model_runner.profile_run()
             self.setup_paged_attention(overhead=overhead)

@@ -132,6 +132,7 @@ cython_debug/
 # IDE
 .idea/
 .vscode/
+.claude-flow/
 *.swp
 *.swo
 *~
