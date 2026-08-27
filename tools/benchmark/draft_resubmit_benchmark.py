@@ -65,6 +65,8 @@ import subprocess
 import sys
 import time
 
+import mlx.core as mx
+
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 from vllm import LLM, SamplingParams  # noqa: E402
@@ -73,14 +75,19 @@ from vllm_metal.v1 import draft_model_proposer as dmp  # noqa: E402
 
 DURS: list[float] = []
 PLANS: list[tuple[int, int]] = []  # (draft_seq_len, n_ingest) per plan
+FIRST_PROPOSE_PEAKS: list[float] = []  # GiB high-water at end of first propose
 
 _orig_propose = dmp.DraftModelProposer.propose
 
 
 def _timed_propose(self, ctx):
+    if len(DURS) == 0:
+        mx.reset_peak_memory()  # isolate the first propose's own allocations
     t0 = time.perf_counter()
     r = _orig_propose(self, ctx)  # self-evals its drafts before returning
     DURS.append(time.perf_counter() - t0)
+    if len(DURS) == 1:
+        FIRST_PROPOSE_PEAKS.append(mx.get_peak_memory() / (2**30))
     return r
 
 
@@ -222,9 +229,12 @@ def _run_spec(args, prompt: str, reference_ids: list[int] | None) -> list[dict]:
     for label in ("gen1_cold", "gen2_resubmit"):
         DURS.clear()
         PLANS.clear()
+        FIRST_PROPOSE_PEAKS.clear()
+        mx.reset_peak_memory()
         t0 = time.perf_counter()
         out = llm.generate([prompt], sp)
         dt = time.perf_counter() - t0
+        peak_mem_gb = mx.get_peak_memory() / (2**30)
         ids = list(out[0].outputs[0].token_ids)
         ms = sorted(d * 1000 for d in DURS)
         first_plan = PLANS[0] if PLANS else (None, None)
@@ -236,6 +246,10 @@ def _run_spec(args, prompt: str, reference_ids: list[int] | None) -> list[dict]:
                 "gen": len(ids),
                 "wall_s": round(dt, 3),
                 "tpot_ms": round(dt / max(len(ids), 1) * 1000, 2),
+                "peak_mem_gb": round(peak_mem_gb, 2),
+                "first_propose_peak_gb": (
+                    round(FIRST_PROPOSE_PEAKS[0], 2) if FIRST_PROPOSE_PEAKS else None
+                ),
                 "propose_calls": len(ms),
                 "propose_first_ms": round(DURS[0] * 1000, 1) if DURS else None,
                 "propose_median_ms": round(ms[len(ms) // 2], 1) if ms else None,

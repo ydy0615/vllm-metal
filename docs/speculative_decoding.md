@@ -13,8 +13,10 @@ path. All require synchronous scheduling and greedy sampling.
 
 All three methods:
 
-- Require `--no-async-scheduling` (vLLM auto-disables async for most spec-decode
-  methods; pass it explicitly to be safe).
+- Run with synchronous scheduling. The Metal platform disables async
+  scheduling automatically whenever speculative decoding is configured
+  (vLLM 0.28.0 auto-enables async for draft-model spec decode); passing
+  `--no-async-scheduling` explicitly remains fine.
 - Only accelerate greedy requests (`temperature=0`). Non-greedy requests skip
   drafting silently.
 - Are lossless under greedy decoding.
@@ -153,6 +155,15 @@ the draft's per-round committed-token ingest also rides the window layout of
 the paged decode kernel, sharing KV block loads across its rows like the
 target's verification window; generated tokens are identical either way, and
 single-stream TPOT is within run-to-run noise of the expanded layout.
+
+The ingest also skips re-computing KV it already holds: the lookahead draft
+steps write KV for drafts `d1..d(K-1)`, and when the verifier accepts those
+drafts the next round's ingest starts after them instead of recomputing
+(shrinking the steady-state K+1-token ingest to 2 rows on full acceptance).
+A skipped position requires both its committed token to equal the drafted
+token and the scheduler's block table to still map it to the same physical
+block the speculative write landed in, so rejected drafts, re-allocated
+blocks, and scratch-block writes always fall back to a full re-ingest.
 
 ---
 

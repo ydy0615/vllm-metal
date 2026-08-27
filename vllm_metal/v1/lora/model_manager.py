@@ -11,6 +11,7 @@ import mlx.nn as nn
 from mlx.utils import tree_unflatten
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import is_in_target_modules
+from vllm.utils.cache import LRUCache
 
 from .layers import (
     MLXLinearWithLoRA,
@@ -52,7 +53,20 @@ class MLXLoRAModelManager:
         )
         self.dtype = dtype
 
-        self._registered: dict[int, LoadedLoRA] = {}
+        if (
+            self.lora_config.max_cpu_loras is not None
+            and self.lora_config.max_cpu_loras < self.lora_slots
+        ):
+            raise ValueError(
+                "LoRAConfig.max_cpu_loras must be greater than or equal to "
+                "LoRAConfig.max_loras. Metal uses max_loras for resident "
+                "execution slots and max_cpu_loras for registered adapter "
+                "capacity."
+            )
+
+        self._registered: LRUCache[int, LoadedLoRA] = LRUCache(self.capacity)
+        self._active: LRUCache[int, None] = LRUCache(self.lora_slots)
+        self._pinned: set[int] = set()
         self.lora_index_to_id: list[int | None] = [None] * self.lora_slots
 
         self.modules: dict[str, _WrappedModule] = {}
@@ -123,11 +137,16 @@ class MLXLoRAModelManager:
 
     def add_adapter(self, adapter: LoadedLoRA) -> bool:
         if adapter.lora_id in self._registered:
+            self._registered.touch(adapter.lora_id)
             return False
+
+        # Validate before eviction so a malformed new adapter cannot destroy a
+        # working cache entry.
+        self._prepare_adapter_update(adapter, 0)
+
         if len(self._registered) >= self.capacity:
-            raise RuntimeError(
-                f"LoRA capacity {self.capacity} exceeded; raise --max-cpu-loras."
-            )
+            evicted_id, _ = self._registered.popitem()
+            self.deactivate_adapter(evicted_id)
         self._registered[adapter.lora_id] = adapter
         return True
 
@@ -138,13 +157,21 @@ class MLXLoRAModelManager:
 
         slot = self._slot_for_adapter(lora_id)
         if slot is None:
-            slot = self._next_free_slot()
+            slot = 0
         prepared = self._prepare_adapter_update(adapter, slot)
 
         self._registered[lora_id] = adapter
-        self._commit_adapter_update(lora_id, slot, prepared)
+        self._registered.touch(lora_id)
+        if self._slot_for_adapter(lora_id) is None:
+            slot = self._next_activation_slot()
+            prepared = self._prepare_adapter_update(adapter, slot)
+            self._activate_prepared(lora_id, slot, prepared)
+        else:
+            self._commit_adapter_update(lora_id, slot, prepared)
+            self._active.touch(lora_id)
 
     def remove_adapter(self, lora_id: int) -> bool:
+        self._pinned.discard(lora_id)
         self.deactivate_adapter(lora_id)
         return self._registered.pop(lora_id, None) is not None
 
@@ -152,23 +179,37 @@ class MLXLoRAModelManager:
         for lid in [lid for lid in self.lora_index_to_id if lid is not None]:
             self.deactivate_adapter(lid)
         self._registered.clear()
+        self._active.clear()
+        self._pinned.clear()
 
     def pin_adapter(self, lora_id: int) -> bool:
-        """Acknowledge upstream pin_lora; Metal has no LoRA cache tier to pin."""
-        return lora_id in self._registered
+        """Pin an adapter in both the registered cache and resident slot cache."""
+        if lora_id not in self._registered:
+            raise ValueError(f"Pinning failed. LoRA {lora_id} is not registered.")
+        if lora_id not in self._active:
+            self.activate_adapter(lora_id)
+        self._pinned.add(lora_id)
+        self._registered.pin(lora_id)
+        self._active.pin(lora_id)
+        return True
+
+    def is_pinned(self, lora_id: int) -> bool:
+        return lora_id in self._pinned
 
     def list_adapters(self) -> set[int]:
         return set(self._registered)
 
     def activate_adapter(self, lora_id: int) -> bool:
-        if self._slot_for_adapter(lora_id) is not None:
-            return False
         if lora_id not in self._registered:
             raise ValueError(f"LoRA adapter {lora_id} is not registered")
+        self._registered.touch(lora_id)
+        if self._slot_for_adapter(lora_id) is not None:
+            self._active.touch(lora_id)
+            return False
         adapter = self._registered[lora_id]
-        slot = self._next_free_slot()
+        slot = self._next_activation_slot()
         prepared = self._prepare_adapter_update(adapter, slot)
-        self._commit_adapter_update(lora_id, slot, prepared)
+        self._activate_prepared(lora_id, slot, prepared)
         logger.info(
             "Activated LoRA %d in slot %d (%d modules)",
             lora_id,
@@ -181,6 +222,7 @@ class MLXLoRAModelManager:
         slot = self._slot_for_adapter(lora_id)
         if slot is None:
             return False
+        self._active.pop(lora_id, None)
         self.lora_index_to_id[slot] = None
         for w in self.modules.values():
             w.reset_lora(slot)
@@ -212,13 +254,46 @@ class MLXLoRAModelManager:
         except ValueError:
             return None
 
-    def _next_free_slot(self) -> int:
-        try:
-            return next(i for i, sid in enumerate(self.lora_index_to_id) if sid is None)
-        except StopIteration as exc:
-            raise ValueError(
-                f"No free LoRA slots; raise --max-loras (current: {self.lora_slots})."
-            ) from exc
+    def _next_activation_slot(self) -> int:
+        """Return a free slot or the slot owned by the LRU unpinned adapter."""
+        slot = next(
+            (i for i, lora_id in enumerate(self.lora_index_to_id) if lora_id is None),
+            None,
+        )
+        if slot is not None:
+            return slot
+        evicted_id = next(
+            (
+                lora_id
+                for lora_id in self._active.order
+                if lora_id not in self._active.pinned_items
+            ),
+            None,
+        )
+        if evicted_id is None:
+            raise RuntimeError(
+                "All resident LoRA slots are pinned; cannot activate another adapter."
+            )
+        evicted_slot = self._slot_for_adapter(evicted_id)
+        if evicted_slot is None:
+            raise RuntimeError(
+                f"Resident LoRA cache is inconsistent: adapter {evicted_id} has no slot."
+            )
+        return evicted_slot
+
+    def _activate_prepared(
+        self,
+        lora_id: int,
+        slot: int,
+        prepared: _PreparedAdapterUpdate,
+    ) -> None:
+        resident_id = self.lora_index_to_id[slot]
+        if resident_id is not None:
+            self.deactivate_adapter(resident_id)
+        self._commit_adapter_update(lora_id, slot, prepared)
+        self._active[lora_id] = None
+        if lora_id in self._pinned:
+            self._active.pin(lora_id)
 
     def _prepare_adapter_update(
         self, adapter: LoadedLoRA, slot: int

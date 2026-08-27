@@ -1215,6 +1215,122 @@ void init_gdn_library(const std::string& src) {
   d.get_library("gdn_kern", [&]() { return gdn_source_; });
 }
 
+// MLX Scatter/SliceUpdate copy their destination unless it is donatable; GDN
+// pools are aliased across sibling layers, so pool[ids] = rows copies the full
+// pool. mx.fast.metal_kernel allocates fresh outputs, so this Primitive aliases
+// the pool with copy_shared_buffer; callers rebind the output so downstream
+// readers depend on the write. Destination slots must be distinct.
+
+class GDNStateScatterPrimitive : public Primitive {
+ public:
+  explicit GDNStateScatterPrimitive(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("GDNStateScatterPrimitive only supports GPU");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    // inputs:  0=pool_in, 1=src_rows, 2=dst_ids
+    // outputs: 0=pool_out (aliases pool_in; the kernel writes in place)
+    const array& pool    = inputs[0];
+    const array& src     = inputs[1];
+    const array& dst_ids = inputs[2];
+    outputs[0].copy_shared_buffer(pool);
+
+    int n = static_cast<int>(dst_ids.size());
+    if (n == 0) {
+      return;
+    }
+    int row_elems = static_cast<int>(pool.size() / pool.shape(0));
+
+    // Four elements per thread when the row divides evenly, which every GDN
+    // state layout does; the scalar kernel is the general fallback.
+    bool vec4 = (row_elems % 4) == 0;
+    int lanes = vec4 ? row_elems / 4 : row_elems;
+
+    auto s = stream();
+    auto& d = metal::device(s.device);
+    auto dt = dtype_to_metal(pool.dtype());
+    std::string kname =
+        std::string("gdn_state_scatter_rows_") + (vec4 ? "vec4_" : "") + dt;
+    auto* lib = d.get_library("gdn_kern");
+    auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+    auto& enc = metal::get_command_encoder(s);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_output_array(outputs[0], 0);
+    enc.set_input_array(src,         1);
+    enc.set_input_array(dst_ids,     2);
+    enc.set_bytes(lanes,             3);
+
+    // 2D thread grid: x walks the row, y selects the update row. One
+    // threadgroup per row leaves most of the GPU idle on a 1 MiB slab.
+    //
+    // dispatch_threads maps to Metal's non-uniform dispatchThreads, so exactly
+    // `lanes` threads run along x and the kernels need no bounds check. This is
+    // the only dispatch_threads call in this file; the others round up through
+    // dispatch_threadgroups, which here would write past the end of a row.
+    int tg_x = std::min<int>(
+        lanes, static_cast<int>(kernel->maxTotalThreadsPerThreadgroup()));
+    enc.dispatch_threads(
+        MTL::Size::Make(lanes, n, 1),
+        MTL::Size::Make(tg_x, 1, 1));
+  }
+
+  const char* name() const override { return "GDNStateScatter"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    return dynamic_cast<const GDNStateScatterPrimitive*>(&other) != nullptr;
+  }
+};
+
+static array gdn_state_scatter_primitive_fn(
+    const array& pool, const array& src, const array& dst_ids) {
+  if (pool.ndim() < 2) {
+    throw std::runtime_error(
+        "gdn_state_scatter: pool must be [num_slots, ...]");
+  }
+  if (pool.dtype() != float16 &&
+      pool.dtype() != bfloat16 &&
+      pool.dtype() != float32) {
+    throw std::runtime_error(
+        "gdn_state_scatter: pool dtype must be float16, bfloat16 or float32");
+  }
+  if (src.dtype() != pool.dtype()) {
+    throw std::runtime_error("gdn_state_scatter: src and pool dtypes differ");
+  }
+  if (dst_ids.dtype() != int32) {
+    throw std::runtime_error("gdn_state_scatter: dst_ids must be int32");
+  }
+  if (dst_ids.ndim() != 1) {
+    throw std::runtime_error("gdn_state_scatter: dst_ids must be 1-D");
+  }
+  if (src.ndim() != pool.ndim() ||
+      !std::equal(
+          pool.shape().begin() + 1, pool.shape().end(),
+          src.shape().begin() + 1)) {
+    throw std::runtime_error(
+        "gdn_state_scatter: src row shape does not match pool row shape");
+  }
+  if (static_cast<size_t>(src.shape(0)) != dst_ids.size()) {
+    throw std::runtime_error(
+        "gdn_state_scatter: one dst id per src row required");
+  }
+  // The Metal kernel flattens all three inputs. Make strided views contiguous
+  // inside the MLX graph. The returned handle aliases this materialized pool,
+  // so callers must rebind it even when the input pool was already contiguous.
+  auto contiguous_pool = contiguous(pool);
+  auto contiguous_src = contiguous(src);
+  auto contiguous_ids = contiguous(dst_ids);
+  auto prim = std::make_shared<GDNStateScatterPrimitive>(
+      default_stream(Device::gpu));
+  return array::make_arrays(
+      {pool.shape()}, {pool.dtype()}, prim,
+      {contiguous_pool, contiguous_src, contiguous_ids})[0];
+}
+
 // ---------------------------------------------------------------------------
 // MLA paged attention (RFC #360)
 // ---------------------------------------------------------------------------
@@ -1631,6 +1747,42 @@ NB_MODULE(_paged_ops, m) {
         "kv_cache.<cache>[layer_idx] to the returned value. key/value are "
         "[num_tokens, num_kv_heads, head_size]; caches are "
         "[num_blocks, block_size, num_kv_heads, head_size].");
+
+  m.def("gdn_state_scatter",
+        [](nb::handle pool_h, nb::handle src_h, nb::handle ids_h) {
+          // inst_ptr<array> on a non-array is undefined behaviour, so check
+          // before dereferencing: a wrong type must raise, not crash.
+          nb::object mx_array_cls =
+              nb::module_::import_("mlx.core").attr("array");
+          for (nb::handle h : {pool_h, src_h, ids_h}) {
+            if (!nb::isinstance(h, mx_array_cls)) {
+              throw std::runtime_error(
+                  "gdn_state_scatter: pool, src and dst_ids must be "
+                  "mlx.core.array");
+            }
+          }
+          auto result = gdn_state_scatter_primitive_fn(
+              *nb::inst_ptr<array>(pool_h),
+              *nb::inst_ptr<array>(src_h),
+              *nb::inst_ptr<array>(ids_h));
+
+          // Same placeholder dance as tq_encode / reshape_and_cache: mint an
+          // mx.core.array and overwrite_descriptor to bypass cross-module
+          // nanobind RTTI.
+          nb::object mx_core  = nb::module_::import_("mlx.core");
+          nb::object arr_cls  = mx_core.attr("array");
+          nb::object zero_arg = nb::int_(0);
+          nb::object out      = arr_cls(zero_arg);
+          nb::inst_ptr<array>(out)->overwrite_descriptor(result);
+          return out;
+        },
+        nb::arg("pool"), nb::arg("src"), nb::arg("dst_ids"),
+        "In-place row scatter into a slot-indexed GDN state pool. Writes "
+        "src[i] into pool[dst_ids[i]] without MLX's whole-pool copy preamble; "
+        "strided inputs are materialized first, and the returned array aliases "
+        "the resulting pool buffer, so the caller MUST rebind its pool "
+        "reference. dst_ids must be distinct int32 slots; src is "
+        "[n, *pool.shape[1:]] with pool's dtype.");
 
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.

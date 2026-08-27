@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import re
 from functools import wraps
 from pathlib import Path
 
@@ -40,6 +39,8 @@ from vllm.model_executor.layers.quantization import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+
+from vllm_metal.gguf.source import RemoteGGUFReference
 
 __all__ = ["GGUFEngineIntegration", "MetalGGUFConfig", "register"]
 
@@ -97,26 +98,6 @@ class GGUFEngineIntegration:
     _GGUF_SUFFIX = ".gguf"
     _GGUF_MAGIC = b"GGUF"
 
-    # Shape-level recognition of the official plugin's remote reference syntax
-    # (``repo_id:quant``). Deliberately enum-free: the GGML enums live in the
-    # optional ``gguf`` package this module must not import, and on this
-    # fail-fast-only path over-recognition is harmless. The tag must read like
-    # a GGUF quant name (Q4_K_M, IQ2_M, UD-Q4_K_XL, F16, ...), which keeps
-    # ordinary ``repo:tag`` strings out.
-    _REMOTE_REF_RE = re.compile(
-        r"^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*:[A-Za-z0-9_+-]+$"
-    )
-    _QUANT_TAG_RE = re.compile(
-        r"(?:^|-)(?:I?Q\d[A-Za-z0-9_]*|F16|F32|BF16|MXFP\d[A-Za-z0-9_]*)$",
-        re.IGNORECASE,
-    )
-
-    _REMOTE_UNSUPPORTED_MSG = (
-        "Remote GGUF references (repo_id:quant) are not supported yet by "
-        "vllm-metal; download the .gguf and pass its local path, with "
-        "--tokenizer pointing at the model's config/tokenizer directory."
-    )
-
     @classmethod
     def register(cls) -> None:
         """Register the GGUF engine integration (idempotent).
@@ -166,31 +147,32 @@ class GGUFEngineIntegration:
         """Whether ``model`` reads as the plugin's ``repo_id:quant`` syntax.
 
         Mirrors the official plugin's public ``is_remote_gguf`` at the shape
-        level (see the class-constant regexes for the deliberate enum-free
-        divergence). Recognized references fail fast in the EngineArgs wrap.
+        level while keeping the optional ``gguf`` package out of this module.
         """
-        if not model or not cls._REMOTE_REF_RE.fullmatch(model):
-            return False
-        _, tag = model.rsplit(":", 1)
-        return cls._QUANT_TAG_RE.search(tag) is not None
+        return model is not None and RemoteGGUFReference.parse(model) is not None
 
     @classmethod
     def _resolve_config_source(
         cls, gguf_model: str, tokenizer: str | None, hf_config_path: str | None
     ) -> str:
         """Config source for a local GGUF, with the official plugin's
-        precedence: ``hf_config_path > tokenizer > parent dir``.
+        precedence: ``hf_config_path > tokenizer > weights repo/parent dir``.
 
         A ``.gguf`` carries weights only, so the resolved LOCAL directory must
         hold the model's ``config.json``; failing fast here names the actual
         inputs instead of letting transformers error on a path the user never
-        typed. A non-local source (a Hub repo id) is passed through for vLLM
-        to resolve.
+        typed. Non-local Hub repo ids are passed through for vLLM to resolve.
         """
         if hf_config_path is not None:
             source = hf_config_path
-        elif tokenizer and not cls._is_local_gguf(tokenizer):
+        elif (
+            tokenizer
+            and not cls._is_local_gguf(tokenizer)
+            and not cls.is_remote_gguf_reference(tokenizer)
+        ):
             source = tokenizer
+        elif remote_ref := RemoteGGUFReference.parse(gguf_model):
+            source = remote_ref.repo_id
         else:
             source = str(Path(gguf_model).parent)
         source_path = Path(source)
@@ -213,11 +195,10 @@ class GGUFEngineIntegration:
 
         @wraps(original)
         def create_model_config(self, *args, **kwargs):
-            if cls.is_remote_gguf_reference(self.model):
-                raise ValueError(cls._REMOTE_UNSUPPORTED_MSG)
-            if cls._is_local_gguf(self.model):
+            is_remote_gguf = cls.is_remote_gguf_reference(self.model)
+            if is_remote_gguf or cls._is_local_gguf(self.model):
                 gguf_model = self.model
-                if Path(gguf_model).suffix != cls._GGUF_SUFFIX:
+                if not is_remote_gguf and Path(gguf_model).suffix != cls._GGUF_SUFFIX:
                     # Detected by magic bytes only: MLX's loader dispatches on
                     # the file extension, so a suffix-less GGUF would die much
                     # later in the worker with a misleading error.

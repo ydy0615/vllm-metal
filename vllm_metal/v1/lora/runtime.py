@@ -44,7 +44,7 @@ class MetalLoRARuntime:
 
     def __init__(self) -> None:
         self._manager: MetalWorkerLoRAManager | None = None
-        self._loaded: dict[int, LoRARequest] = {}
+        self._requests_by_id: dict[int, LoRARequest] = {}
 
     @property
     def enabled(self) -> bool:
@@ -103,7 +103,7 @@ class MetalLoRARuntime:
             return False
         added = self._manager.add_adapter(lora_request)
         if added:
-            self._loaded[lora_request.lora_int_id] = lora_request
+            self._requests_by_id[lora_request.lora_int_id] = lora_request
         return added
 
     def remove_adapter(self, lora_id: int) -> bool:
@@ -111,7 +111,7 @@ class MetalLoRARuntime:
             return False
         removed = self._manager.remove_adapter(lora_id)
         if removed:
-            self._loaded.pop(lora_id, None)
+            self._requests_by_id.pop(lora_id, None)
         return removed
 
     def pin_adapter(self, lora_id: int) -> bool:
@@ -134,14 +134,14 @@ class MetalLoRARuntime:
             builder.add_request(lora_id, num_tokens)
             if lora_id is None:
                 continue
-            req = self._loaded.get(lora_id)
-            if req is None:
+            lora_request = self._requests_by_id.get(lora_id)
+            if lora_request is None:
                 raise ValueError(
                     f"LoRA id {lora_id} was routed for this step but is not "
-                    f"loaded (loaded ids: {sorted(self._loaded)}). The engine "
+                    f"known (known ids: {sorted(self._requests_by_id)}). The engine "
                     "must call add_lora before scheduling a request that uses "
                     "it."
                 )
-            active_requests.add(req)
+            active_requests.add(lora_request)
         mapping = builder.build() if not builder.is_empty() else None
         self._manager.set_active_adapters(active_requests, mapping)

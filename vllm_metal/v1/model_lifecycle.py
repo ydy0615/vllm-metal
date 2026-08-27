@@ -88,7 +88,18 @@ class GenerationLoadRequest:
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
         if model_adapter.should_force_text_backbone(hf_config):
             is_vlm = False
-        gguf_source = None if is_vlm else GGUFLoadSource.from_model_config(model_config)
+        if is_vlm and model_config.quantization == "gguf":
+            raise NotImplementedError(
+                "Multimodal GGUF checkpoints are not supported by vllm-metal."
+            )
+        gguf_source = (
+            None
+            if is_vlm
+            else GGUFLoadSource.from_model_config(
+                model_config,
+                runner.vllm_config.load_config,
+            )
+        )
 
         # A pipeline-parallel stage prunes its non-owned layers right after load, so
         # the generic MLX loaders stay lazy until the stage-owned weights are known.
@@ -259,7 +270,10 @@ class ModelLifecycle:
 
         start_time = time.time()
         if gguf_source is None and not is_vlm:
-            gguf_source = GGUFLoadSource.from_model_config(model_config)
+            gguf_source = GGUFLoadSource.from_model_config(
+                model_config,
+                self._runner.vllm_config.load_config,
+            )
         is_gguf = gguf_source is not None
         awq_loader = None if is_gguf or is_vlm else AWQQuantLoader.for_model(model_name)
 

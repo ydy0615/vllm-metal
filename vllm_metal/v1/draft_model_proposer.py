@@ -55,6 +55,20 @@ Each step: ingest advances every row's committed KV to ``committed_len``,
 then ``num_speculative_tokens - 1`` single-token decode steps run for
 drafting rows only. Drafts are handed back via ``take_draft_token_ids`` and
 verified next step by ``SpeculativeDecodeController.verify_greedy``.
+
+**Skipping already-valid speculative KV (#482, direction 2).** The
+lookahead draft steps write KV for drafts ``d1..d(K-1)`` at positions
+``[committed_len, committed_len + K - 1)``. When the next round's committed
+tokens match those drafts (greedy acceptance is a prefix, so accepted drafts
+keep their identities), that KV is exactly what the ingest would recompute
+-- so the ingest skips it (``_speculative_kv_valid_through``), shrinking the
+steady-state K+1-token ingest to 2 rows on full acceptance. A position is
+skipped only when its committed token equals the recorded drafted token AND
+the scheduler's committed-group block table still maps the position to the
+same physical block the speculative write landed in (speculative KV that
+crossed into a scratch block is never reused -- the scheduler allocates its
+own block there). The last committed token is always re-ingested: its
+logits are needed to predict this round's first draft token anyway.
 """
 
 from __future__ import annotations
@@ -106,6 +120,10 @@ class _DraftPlan:
     req_id: str
     block_ids: list[int]
     committed_len: int
+    # Effective start of this step's ingest forward: the position whose KV
+    # is not already valid in the draft cache (either never written, or
+    # written speculatively last round with a token/block that no longer
+    # matches -- see _speculative_kv_valid_through).
     draft_seq_len: int
     ingest_tokens: list[int]
     is_drafting: bool
@@ -155,6 +173,15 @@ class DraftModelProposer:
         # first time a request is seen (see _make_decode_plan), so a
         # resubmitted/shared prefix skips re-ingest (#482).
         self._draft_seq_lens: dict[str, int] = {}
+        # Speculative KV written by past lookahead draft steps, per request:
+        # position -> (block_id, drafted token). Lets the next round's ingest
+        # skip re-ingesting accepted drafts whose KV the lookahead already
+        # wrote (#482 direction 2). Entries are replaced wholesale each time
+        # a request drafts, and survive non-drafting rounds in between --
+        # each position is re-validated against the current committed tokens
+        # and block table before use, so staleness can only cost performance,
+        # never correctness.
+        self._spec_kv_writes: dict[str, dict[int, tuple[int, int]]] = {}
         # Scheduler-owned KV-cache group index for the committed portion.
         # Unknown at construction time -- the physical backend below is
         # built before the scheduler has decided kv_cache_config (see
@@ -300,6 +327,21 @@ class DraftModelProposer:
         mx.eval(drafts)
         rows: list[list[int]] = drafts.tolist()  # type: ignore[assignment]
 
+        # Record the speculative KV this round's lookahead steps wrote, for
+        # next round's ingest skip (see module docstring). Draft step i fed
+        # row[i-1] at position committed_len + i - 1 for i in 1..K-1, writing
+        # its KV there; the K-th draft's KV is never written (no step feeds
+        # it before verification).
+        for plan, row in zip(drafting_plans, rows, strict=True):
+            writes: dict[int, tuple[int, int]] = {}
+            for i in range(num_speculative_tokens - 1):
+                position = plan.committed_len + i
+                writes[position] = (
+                    plan.block_ids[position // self._block_size],
+                    int(row[i]),
+                )
+            self._spec_kv_writes[plan.req_id] = writes
+
         return DraftTokenIds(
             req_ids=[plan.req_id for plan in drafting_plans],
             draft_token_ids=[[int(token) for token in row] for row in rows],
@@ -315,6 +357,7 @@ class DraftModelProposer:
             if blocks is not None:
                 self._scratch_free_blocks.extend(blocks)
             self._draft_seq_lens.pop(req_id, None)
+            self._spec_kv_writes.pop(req_id, None)
 
     # -- internals -----------------------------------------------------------
 
@@ -325,6 +368,9 @@ class DraftModelProposer:
         for req_id in list(self._draft_seq_lens.keys()):
             if req_id not in request_states:
                 del self._draft_seq_lens[req_id]
+        for req_id in list(self._spec_kv_writes.keys()):
+            if req_id not in request_states:
+                del self._spec_kv_writes[req_id]
 
     def _collect_draft_plans(
         self, ctx: ProposeContext, num_speculative_tokens: int
@@ -388,9 +434,26 @@ class DraftModelProposer:
             return None
         is_drafting = req_id in drafting_req_ids
         assert self._committed_group_index is not None
+        committed_group_block_ids = state.block_ids[self._committed_group_index]
+        # Skip the leading accepted drafts whose KV the previous round's
+        # lookahead steps already wrote (#482 direction 2); the walk stops at
+        # the first position whose recorded token or block no longer matches
+        # what is now committed. Capped one short of committed_len: the last
+        # committed token's row must still run (its logits predict this
+        # round's first draft token), so the ingest is never empty.
+        draft_seq_len = min(
+            self._speculative_kv_valid_through(
+                req_id,
+                state.token_ids,
+                committed_group_block_ids,
+                draft_seq_len,
+                committed_len,
+            ),
+            committed_len - 1,
+        )
         block_ids = self._ensure_blocks(
             req_id,
-            committed_group_block_ids=state.block_ids[self._committed_group_index],
+            committed_group_block_ids=committed_group_block_ids,
             total_positions=committed_len
             + (num_speculative_tokens if is_drafting else 0),
         )
@@ -475,16 +538,48 @@ class DraftModelProposer:
 
         return list(committed_group_block_ids) + scratch_blocks
 
+    def _speculative_kv_valid_through(
+        self,
+        req_id: str,
+        token_ids: list[int],
+        committed_group_block_ids: list[int],
+        draft_seq_len: int,
+        committed_len: int,
+    ) -> int:
+        """First position in ``[draft_seq_len, committed_len)`` whose committed
+        KV is not already valid in the draft cache.
+
+        Consults the speculative-write ledger from the last round that
+        drafted this request. A position is skippable only when its committed
+        token equals the recorded drafted token AND the position still maps
+        to the same scheduler-owned committed block the speculative write
+        landed in; anything else (rejected draft, scratch-block write,
+        re-allocated block table, no ledger) stops the walk, because the
+        ingest forward must be one contiguous range of positions whose KV is
+        valid up to its start.
+        """
+        writes = self._spec_kv_writes.get(req_id)
+        if not writes:
+            return draft_seq_len
+        position = draft_seq_len
+        while position < committed_len:
+            write = writes.get(position)
+            if write is None:
+                break
+            block_id, drafted_token = write
+            block_index = position // self._block_size
+            if (
+                block_index >= len(committed_group_block_ids)
+                or committed_group_block_ids[block_index] != block_id
+                or token_ids[position] != drafted_token
+            ):
+                break
+            position += 1
+        return position
+
     def _ingest_and_draft_first(
         self, plans: list[_DraftPlan], offset_caches: list[OffsetCache]
     ) -> mx.array:
-        packed: list[int] = []
-        last_rows: list[int] = []
-        for plan in plans:
-            packed.extend(plan.ingest_tokens)
-            last_rows.append(len(packed) - 1)
-        input_ids = mx.array([packed], dtype=mx.int32)
-
         # The steady-state ingest (K+1 committed tokens per accepted round)
         # rides the decode path as one single-query segment per token — the
         # same shape the target's verify rows use. Submitting it as a prefill
@@ -493,6 +588,12 @@ class DraftModelProposer:
         # per pass at an 8k prefix (#482, Problem 2). Large ingests (the
         # first-propose catch-up) stay on the tiled path, where it wins.
         if max(len(plan.ingest_tokens) for plan in plans) <= _DECODE_INGEST_MAX_TOKENS:
+            packed: list[int] = []
+            last_rows: list[int] = []
+            for plan in plans:
+                packed.extend(plan.ingest_tokens)
+                last_rows.append(len(packed) - 1)
+            input_ids = mx.array([packed], dtype=mx.int32)
             decode_specs = [
                 (plan.block_ids, plan.draft_seq_len, len(plan.ingest_tokens))
                 for plan in plans
@@ -510,18 +611,58 @@ class DraftModelProposer:
                 merge_verify_windows=self._merge_ingest_windows
                 and envs.VLLM_METAL_SPEC_VERIFY_WINDOW,
             )
-        else:
-            prefill_specs = [
-                (plan.block_ids, len(plan.ingest_tokens), plan.draft_seq_len)
-                for plan in plans
-            ]
-            prepare_unified([], prefill_specs, self._block_size)
-        try:
-            logits = self._extract_logits(self._model(input_ids, cache=offset_caches))
-        finally:
-            clear_context()
+            try:
+                logits = self._extract_logits(
+                    self._model(input_ids, cache=offset_caches)
+                )
+            finally:
+                clear_context()
 
-        last = mx.take(logits[0], mx.array(last_rows, dtype=mx.int32), axis=0)
+            last = mx.take(logits[0], mx.array(last_rows, dtype=mx.int32), axis=0)
+            return mx.argmax(last, axis=-1)
+
+        # Cold ingest: a fresh prefix re-ingests the whole prompt into the
+        # draft cache in one tiled prefill forward, stalling the engine for
+        # the full prompt length (#482, direction 3). Run it in chunks so
+        # each dispatch is bounded (default 1024 tokens, ~2 ms of draft-model
+        # work) and the logits peak allocation scales with the chunk, not the
+        # prompt. The chunk start maps to draft position
+        # ``draft_seq_len + start``, and the final row of each plan's last
+        # chunk is the last ingested token, whose logits predict the plan's
+        # first draft token — identical to the single-forward path.
+        max_len = max(len(plan.ingest_tokens) for plan in plans)
+        chunk_size = envs.VLLM_METAL_SPEC_INGEST_CHUNK
+        if chunk_size <= 0:
+            chunk_size = max_len  # "0" restores the single-forward behavior
+        final_rows: dict[int, mx.array] = {}
+        for start in range(0, max_len, chunk_size):
+            round_packed: list[int] = []
+            prefill_specs: list[tuple[list[int], int, int]] = []
+            final_row_indices: list[tuple[int, int]] = []
+            for plan_index, plan in enumerate(plans):
+                ingest_len = len(plan.ingest_tokens)
+                end = min(start + chunk_size, ingest_len)
+                if end <= start:
+                    continue
+                round_packed.extend(plan.ingest_tokens[start:end])
+                prefill_specs.append(
+                    (plan.block_ids, end - start, plan.draft_seq_len + start)
+                )
+                final_row_indices.append((plan_index, len(round_packed) - 1))
+            input_ids = mx.array([round_packed], dtype=mx.int32)
+            prepare_unified([], prefill_specs, self._block_size)
+            try:
+                logits = self._extract_logits(
+                    self._model(input_ids, cache=offset_caches)
+                )
+            finally:
+                clear_context()
+            for plan_index, row in final_row_indices:
+                final_rows[plan_index] = logits[0][row]
+
+        last = mx.stack(
+            [final_rows[plan_index] for plan_index in range(len(plans))], axis=0
+        )
         return mx.argmax(last, axis=-1)
 
     def _draft_step(

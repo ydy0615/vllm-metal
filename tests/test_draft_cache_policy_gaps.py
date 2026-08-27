@@ -17,6 +17,11 @@ The first two run end-to-end in a spawned child process (``spawn`` start
 method -- Metal is not fork-safe) with Qwen3-0.6B draft==target, recording
 each request's first draft plan (``draft_seq_len`` / ingest length) via a
 monkeypatched proposer. The third is stub-level, no weights.
+
+A fourth test (``test_chunked_cold_ingest_token_identity_e2e``) runs two
+spawned children -- ``VLLM_METAL_SPEC_INGEST_CHUNK=16`` (chunked cold
+ingest) vs ``0`` (single forward) -- and asserts the generated tokens are
+identical, i.e. the chunk boundaries are lossless (#482 direction 3).
 """
 
 from __future__ import annotations
@@ -57,6 +62,38 @@ def _setenv_default(key: str, default: str) -> None:
         os.environ[key] = default
 
 
+def _install_plan_logger(dmp, plans: list) -> None:
+    """Record every draft plan as (draft_seq_len, n_ingest) into ``plans``."""
+    if hasattr(dmp.DraftModelProposer, "_make_plan"):
+        _orig_make_plan = dmp.DraftModelProposer._make_plan
+
+        def _logged_make_plan(self, req_id, state, num_speculative_tokens):
+            plan = _orig_make_plan(self, req_id, state, num_speculative_tokens)
+            if plan is not None:
+                plans.append((plan.draft_seq_len, len(plan.ingest_tokens)))
+            return plan
+
+        dmp.DraftModelProposer._make_plan = _logged_make_plan
+    else:
+        _orig_decode = dmp.DraftModelProposer._make_decode_plan
+        _orig_prefill = dmp.DraftModelProposer._make_prefill_plan
+
+        def _logged_decode(self, req_id, state, k, drafting_req_ids):
+            plan = _orig_decode(self, req_id, state, k, drafting_req_ids)
+            if plan is not None:
+                plans.append((plan.draft_seq_len, len(plan.ingest_tokens)))
+            return plan
+
+        def _logged_prefill(self, prefill, result_mode, k, drafting_req_ids):
+            plan = _orig_prefill(self, prefill, result_mode, k, drafting_req_ids)
+            if plan is not None:
+                plans.append((plan.draft_seq_len, len(plan.ingest_tokens)))
+            return plan
+
+        dmp.DraftModelProposer._make_decode_plan = _logged_decode
+        dmp.DraftModelProposer._make_prefill_plan = _logged_prefill
+
+
 def _run_policy_e2e() -> None:
     """Body of the e2e test -- runs in a spawned child process."""
     _setenv_default("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -71,36 +108,7 @@ def _run_policy_e2e() -> None:
     from vllm_metal.v1 import draft_model_proposer as dmp
 
     plans: list[tuple[int, int]] = []
-
-    def _note_plan(plan) -> None:
-        if plan is not None:
-            plans.append((plan.draft_seq_len, len(plan.ingest_tokens)))
-
-    if hasattr(dmp.DraftModelProposer, "_make_plan"):
-        _orig_make_plan = dmp.DraftModelProposer._make_plan
-
-        def _logged_make_plan(self, req_id, state, num_speculative_tokens):
-            plan = _orig_make_plan(self, req_id, state, num_speculative_tokens)
-            _note_plan(plan)
-            return plan
-
-        dmp.DraftModelProposer._make_plan = _logged_make_plan
-    else:
-        _orig_decode = dmp.DraftModelProposer._make_decode_plan
-        _orig_prefill = dmp.DraftModelProposer._make_prefill_plan
-
-        def _logged_decode(self, req_id, state, k, drafting_req_ids):
-            plan = _orig_decode(self, req_id, state, k, drafting_req_ids)
-            _note_plan(plan)
-            return plan
-
-        def _logged_prefill(self, prefill, result_mode, k, drafting_req_ids):
-            plan = _orig_prefill(self, prefill, result_mode, k, drafting_req_ids)
-            _note_plan(plan)
-            return plan
-
-        dmp.DraftModelProposer._make_decode_plan = _logged_decode
-        dmp.DraftModelProposer._make_prefill_plan = _logged_prefill
+    _install_plan_logger(dmp, plans)
 
     llm = LLM(
         model=MODEL_NAME,
@@ -185,6 +193,85 @@ def test_draft_cache_honors_scheduler_cache_policy_e2e() -> None:
         raise AssertionError(
             "Draft cache-policy e2e test failed in spawned child "
             f"(exit code: {proc.exitcode})"
+        )
+
+
+def _run_chunked_identity_e2e(chunk: str, result_q: mp.Queue) -> None:
+    """Body of the chunked-ingest e2e -- runs in a spawned child process.
+
+    Generates once on a fresh prompt with ``VLLM_METAL_SPEC_INGEST_CHUNK``
+    set to ``chunk`` and reports (first-plan ingest length, token ids) back
+    through ``result_q``.  The fresh prompt's first propose ingests the whole
+    prompt (>16 tokens), so a chunk of 16 splits the cold ingest into
+    multiple forwards while a chunk of 0 keeps the single-forward behavior.
+    """
+    _setenv_default("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    _setenv_default("VLLM_METAL_USE_PAGED_ATTENTION", DEFAULT_USE_PAGED_ATTENTION)
+    _setenv_default("VLLM_METAL_MEMORY_FRACTION", DEFAULT_PAGED_MEMORY_FRACTION)
+    if os.environ.get("VLLM_METAL_USE_PAGED_ATTENTION", "0") != "1":
+        result_q.put(("skipped", -1, []))
+        return
+    os.environ["VLLM_METAL_SPEC_INGEST_CHUNK"] = chunk
+
+    from vllm import LLM, SamplingParams
+
+    from vllm_metal.v1 import draft_model_proposer as dmp
+
+    plans: list[tuple[int, int]] = []
+    _install_plan_logger(dmp, plans)
+
+    llm = LLM(
+        model=MODEL_NAME,
+        max_model_len=1024,
+        max_num_seqs=1,
+        enable_prefix_caching=True,
+        async_scheduling=False,
+        speculative_config={
+            "method": "draft_model",
+            "model": MODEL_NAME,
+            "num_speculative_tokens": K,
+        },
+    )
+    sp = SamplingParams(temperature=0, max_tokens=GEN)
+    tokens = list(llm.generate([SALT_PROMPT], sp)[0].outputs[0].token_ids)
+    first_plan = plans[0] if plans else (-1, -1)
+    result_q.put(("ok", first_plan[1], tokens))
+
+
+@pytest.mark.slow
+def test_chunked_cold_ingest_token_identity_e2e() -> None:
+    """Chunked cold ingest (chunk=16) is lossless: the generated tokens are
+    identical to the single-forward control (chunk=0), and both runs took the
+    chunked path (first-plan ingest > the 16-token decode threshold)."""
+    ctx = mp.get_context("spawn")
+    result_q = ctx.Queue()
+    procs = [
+        ctx.Process(target=_run_chunked_identity_e2e, args=(chunk, result_q))
+        for chunk in ("16", "0")
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join()
+    if any(proc.exitcode != 0 for proc in procs):
+        raise AssertionError(
+            "Chunked-ingest e2e failed in a spawned child "
+            f"(exit codes: {[proc.exitcode for proc in procs]})"
+        )
+
+    chunked, control = (result_q.get(), result_q.get())
+    for label, (status, ingest, _) in (("chunked", chunked), ("control", control)):
+        if status != "ok":
+            raise AssertionError(f"{label} child skipped (non-paged attention?)")
+        if ingest <= 16:
+            raise AssertionError(
+                f"{label} first plan ingested {ingest} tokens -- expected a "
+                ">16-token cold full-prompt ingest on the chunked path"
+            )
+    if chunked[2] != control[2]:
+        raise AssertionError(
+            "chunked cold ingest changed the generated tokens:\n"
+            f"chunk=16: {chunked[2]}\nchunk=0:  {control[2]}"
         )
 
 

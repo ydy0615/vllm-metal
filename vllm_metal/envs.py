@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
+    VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
@@ -93,6 +94,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and at conc 32 on M2 Max. Outputs are bitwise identical either way.
     "VLLM_METAL_SPEC_VERIFY_WINDOW": lambda: (
         os.getenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0") == "1"
+    ),
+    # Max tokens of cold draft KV ingested per forward (issue #482,
+    # direction 3). The first propose of a fresh prefix ingests the whole
+    # prompt into the draft model's KV in one tiled prefill forward;
+    # chunking bounds the stall at any single dispatch and the logits peak
+    # allocation (draft_vocab x chunk instead of x prompt length). 1024
+    # tokens is ~2 ms of draft-model work on a modern M-series chip; a
+    # multiple of the block size is recommended. Set to "0" to restore the
+    # single-forward behavior.
+    "VLLM_METAL_SPEC_INGEST_CHUNK": lambda: int(
+        os.getenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1024")
     ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended
