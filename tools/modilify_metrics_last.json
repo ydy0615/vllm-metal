@@ -1,0 +1,72 @@
+{
+  "temperature": 0.8,
+  "seed": 0,
+  "prompt": "Explain why the sky is blue.",
+  "prompt_tokens": 16,
+  "decode_b1": {
+    "batch": 1,
+    "prompt_tokens": 16,
+    "prefill_s": 0.07624612504150718,
+    "first_denoise_s": 0.24771662498824298,
+    "ttfd_s": 0.32396275002975017,
+    "n_steady": 4,
+    "steady_s": 1.0374963749200106,
+    "denoise_per_sec": 3.8554351578417747,
+    "row_denoise_per_sec": 3.8554351578417747,
+    "ms_per_denoise": 259.37409373000264,
+    "canvas_tokens": 256
+  },
+  "decode_b2": {
+    "batch": 2,
+    "prompt_tokens": 16,
+    "prefill_s": 0.07292191707529128,
+    "first_denoise_s": 0.40603320801164955,
+    "ttfd_s": 0.4789551250869408,
+    "n_steady": 4,
+    "steady_s": 1.6491877919761464,
+    "denoise_per_sec": 2.425436338700387,
+    "row_denoise_per_sec": 4.850872677400774,
+    "ms_per_denoise": 412.29694799403654,
+    "canvas_tokens": 512
+  },
+  "denoise_breakdown": {
+    "latent_s": 0.013196124928072095,
+    "decoder_s": 0.20500366704072803,
+    "vocab_s": 0.038135958020575345,
+    "total_s": 0.25633574998937547,
+    "latent_frac": 0.05147984597785929,
+    "decoder_frac": 0.7997466878858098,
+    "vocab_frac": 0.14877346613633094
+  },
+  "prefix_cache": {
+    "prompt_tokens": 16,
+    "miss_prefill_s": 0.0799393750494346,
+    "hit_prefill_s": 0.0015056669944897294,
+    "hit_ttfd_s": 0.2515830419724807,
+    "miss_ttfd_s": 0.3300167500274256,
+    "prefill_speedup": 53.09233405659268,
+    "cache_hits": 1,
+    "n_steady_unused": 4
+  },
+  "chunked_prefill": {
+    "prompt_tokens": 512,
+    "chunk_size": 256,
+    "oneshot_prefill_s": 0.2960985830286518,
+    "chunked_prefill_s": 0.3450779588893056,
+    "offset_oneshot": 512,
+    "offset_chunked": 512,
+    "offsets_match": true
+  },
+  "continuous_batch": {
+    "batch": 2,
+    "prefix_lengths": [
+      8,
+      16
+    ],
+    "packed_denoise_s": 0.4178180838935077,
+    "sequential_denoise_s": 0.5043755830265582,
+    "packed_denoise_per_sec": 2.393386113595976,
+    "sequential_denoise_per_sec": 3.965299009913985,
+    "pack_speedup_vs_seq": 1.2071655164526387
+  }
+}

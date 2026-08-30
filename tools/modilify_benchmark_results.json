@@ -1,0 +1,150 @@
+{
+  "model": "/Users/allenyuan/Modilify-Mk1",
+  "temperature": 0.8,
+  "denoise_steps": 128,
+  "single_request_results": [
+    {
+      "test": "pp1024/tg128",
+      "prompt_tokens": 1024,
+      "denoise_steps": 128,
+      "ttft_ms": 782.8,
+      "tpot_ms": 265.75,
+      "prefill_tps": 1910.0,
+      "gen_dps": 3.8,
+      "e2e_latency_s": 34.552,
+      "throughput_tps": 33.3,
+      "peak_memory_gb": 48.82
+    },
+    {
+      "test": "pp4096/tg128",
+      "prompt_tokens": 4096,
+      "denoise_steps": 128,
+      "ttft_ms": 2598.3,
+      "tpot_ms": 275.94,
+      "prefill_tps": 1814.4,
+      "gen_dps": 3.6,
+      "e2e_latency_s": 37.578,
+      "throughput_tps": 112.4,
+      "peak_memory_gb": 50.33
+    },
+    {
+      "test": "pp8192/tg128",
+      "prompt_tokens": 8192,
+      "denoise_steps": 128,
+      "ttft_ms": 6096.3,
+      "tpot_ms": 299.04,
+      "prefill_tps": 1438.3,
+      "gen_dps": 3.3,
+      "e2e_latency_s": 43.973,
+      "throughput_tps": 189.2,
+      "peak_memory_gb": 53.39
+    },
+    {
+      "test": "pp16384/tg128",
+      "prompt_tokens": 16384,
+      "denoise_steps": 128,
+      "ttft_ms": 10737.9,
+      "tpot_ms": 320.46,
+      "prefill_tps": 1587.4,
+      "gen_dps": 3.1,
+      "e2e_latency_s": 51.341,
+      "throughput_tps": 321.6,
+      "peak_memory_gb": 52.3
+    },
+    {
+      "test": "pp32768/tg128",
+      "prompt_tokens": 32768,
+      "denoise_steps": 128,
+      "ttft_ms": 23550.4,
+      "tpot_ms": 368.75,
+      "prefill_tps": 1418.3,
+      "gen_dps": 2.7,
+      "e2e_latency_s": 70.304,
+      "throughput_tps": 467.9,
+      "peak_memory_gb": 54.67
+    },
+    {
+      "test": "pp65536/tg128",
+      "prompt_tokens": 65536,
+      "denoise_steps": 128,
+      "ttft_ms": 66627.6,
+      "tpot_ms": 558.87,
+      "prefill_tps": 992.2,
+      "gen_dps": 1.8,
+      "e2e_latency_s": 137.59,
+      "throughput_tps": 477.2,
+      "peak_memory_gb": 59.42
+    },
+    {
+      "test": "pp131072/tg128",
+      "prompt_tokens": 131072,
+      "denoise_steps": 128,
+      "ttft_ms": 262213.0,
+      "tpot_ms": 961.18,
+      "prefill_tps": 502.0,
+      "gen_dps": 1.0,
+      "e2e_latency_s": 384.155,
+      "throughput_tps": 341.5,
+      "peak_memory_gb": 68.92
+    },
+    {
+      "test": "pp200000/tg128",
+      "prompt_tokens": 200000,
+      "denoise_steps": 128,
+      "ttft_ms": 451413.7,
+      "tpot_ms": 1159.07,
+      "prefill_tps": 444.3,
+      "gen_dps": 0.9,
+      "e2e_latency_s": 598.506,
+      "throughput_tps": 334.4,
+      "peak_memory_gb": 78.49
+    }
+  ],
+  "continuous_batching_results": [
+    {
+      "batch_size": 1,
+      "label": "1x (基准线)",
+      "gen_dps": 3.8,
+      "speedup": 1.0,
+      "prefill_tps": 1910.0,
+      "pp_tps_per_req": 1910.0,
+      "avg_ttft_ms": 782.8,
+      "e2e_latency_s": 34.552,
+      "peak_memory_gb": 48.82
+    },
+    {
+      "batch_size": 2,
+      "label": "2x",
+      "gen_dps": 3.8,
+      "speedup": 0.99,
+      "prefill_tps": 1396.3,
+      "pp_tps_per_req": 698.1,
+      "avg_ttft_ms": 1983.3,
+      "e2e_latency_s": 69.364,
+      "peak_memory_gb": 50.01
+    },
+    {
+      "batch_size": 4,
+      "label": "4x",
+      "gen_dps": 4.3,
+      "speedup": 1.14,
+      "prefill_tps": 1467.7,
+      "pp_tps_per_req": 366.9,
+      "avg_ttft_ms": 3708.9,
+      "e2e_latency_s": 121.447,
+      "peak_memory_gb": 52.39
+    },
+    {
+      "batch_size": 8,
+      "label": "8x",
+      "gen_dps": 4.3,
+      "speedup": 1.14,
+      "prefill_tps": 1498.8,
+      "pp_tps_per_req": 187.3,
+      "avg_ttft_ms": 7288.4,
+      "e2e_latency_s": 241.593,
+      "peak_memory_gb": 57.16
+    }
+  ],
+  "markdown_report": "### ⚡ 单请求结果\n\n| 测试 | TTFT (毫秒) | TPOT (毫秒/Denoise) | 预处理 TPS | 生成 dPS | 端到端延迟 | 吞吐量 | 峰值内存 |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n| **pp1024/tg128** | 782.8 | 265.75 | 1910.0 tok/s | **3.8 dPS** | 34.552s | 33.3 tok/s | 48.82 GB |\n| **pp4096/tg128** | 2598.3 | 275.94 | 1814.4 tok/s | **3.6 dPS** | 37.578s | 112.4 tok/s | 50.33 GB |\n| **pp8192/tg128** | 6096.3 | 299.04 | 1438.3 tok/s | **3.3 dPS** | 43.973s | 189.2 tok/s | 53.39 GB |\n| **pp16384/tg128** | 10737.9 | 320.46 | 1587.4 tok/s | **3.1 dPS** | 51.341s | 321.6 tok/s | 52.30 GB |\n| **pp32768/tg128** | 23550.4 | 368.75 | 1418.3 tok/s | **2.7 dPS** | 70.304s | 467.9 tok/s | 54.67 GB |\n| **pp65536/tg128** | 66627.6 | 558.87 | 992.2 tok/s | **1.8 dPS** | 137.590s | 477.2 tok/s | 59.42 GB |\n| **pp131072/tg128** | 262213.0 | 961.18 | 502.0 tok/s | **1.0 dPS** | 384.155s | 341.5 tok/s | 68.92 GB |\n| **pp200000/tg128** | 451413.7 | 1159.07 | 444.3 tok/s | **0.9 dPS** | 598.506s | 334.4 tok/s | 78.49 GB |\n\n### 🥞 连续批处理\n\n*预处理1024 / 生成128*\n\n| 批大小 | 生成 dPS | 加速比 | 预处理 TPS | pp TPS/请求 | 平均 TTFT (ms) | 端到端延迟 |\n| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n| **1x (基准线)** | **3.8 dPS** | 1.00x | 1910.0 tok/s | 1910.0 tok/s | 782.8 | 34.552s |\n| **2x** | **3.8 dPS** | 0.99x | 1396.3 tok/s | 698.1 tok/s | 1983.3 | 69.364s |\n| **4x** | **4.3 dPS** | **1.14x** | 1467.7 tok/s | 366.9 tok/s | 3708.9 | 121.447s |\n| **8x** | **4.3 dPS** | **1.14x** | 1498.8 tok/s | 187.3 tok/s | 7288.4 | 241.593s |\n"
+}
