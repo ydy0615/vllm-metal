@@ -219,8 +219,18 @@ class SamplingBatch:
         if self.no_top_k:
             return None
 
+        # Match vLLM's per-row convention: top_k <= 0 (or >= vocab_size)
+        # disables top-k, and the sentinel is vocab_size, not 0. The PyTorch
+        # top-k path computes a gather index of vocab_size - top_k, so a 0
+        # sentinel indexes out of bounds (issue #646). GPUInputBatch and the
+        # v1 sampler states normalize the same way.
         return torch.tensor(
-            [sampling_params.top_k for sampling_params in self.sampling_params_list],
+            [
+                sampling_params.top_k
+                if 0 < sampling_params.top_k < self.vocab_size
+                else self.vocab_size
+                for sampling_params in self.sampling_params_list
+            ],
             dtype=torch.int32,
             device=self.SAMPLER_DEVICE,
         )

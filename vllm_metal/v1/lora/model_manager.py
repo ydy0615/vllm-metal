@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _WrappedModule = MLXLinearWithLoRA | MLXQuantizedLinearWithLoRA
-_PreparedLoRAWeights = tuple[mx.array, mx.array]
+_PreparedLoRAWeights = tuple[mx.array, mx.array, int]
 _PreparedModuleUpdate = tuple[_WrappedModule, _PreparedLoRAWeights | None]
 
 
@@ -306,14 +306,15 @@ class MLXLoRAModelManager:
                 updates.append((module, None))
                 continue
             loaded += 1
+            lora_a, lora_b = module.prepare_lora_weights(
+                slot,
+                weights.lora_a,
+                weights.lora_b * weights.scaling,
+            )
             updates.append(
                 (
                     module,
-                    module.prepare_lora_weights(
-                        slot,
-                        weights.lora_a,
-                        weights.lora_b * weights.scaling,
-                    ),
+                    (lora_a, lora_b, int(weights.lora_a.shape[0])),
                 )
             )
         if loaded == 0:
@@ -335,8 +336,8 @@ class MLXLoRAModelManager:
             if weights is None:
                 module.reset_lora(slot)
                 continue
-            lora_a, lora_b = weights
-            module.set_prepared_lora(slot, lora_a, lora_b)
+            lora_a, lora_b, rank = weights
+            module.set_prepared_lora(slot, lora_a, lora_b, rank=rank)
         self.lora_index_to_id[slot] = lora_id
         self._last_mapping = None
 

@@ -24,16 +24,20 @@ class _LoRAMappingBuilder:
     def __init__(self) -> None:
         self._idx: list[int] = []
         self._prompt: list[int] = []
-        self._is_prefill = False
+        self._use_prefill_routing = True
 
     def add_request(self, lora_id: int | None, num_tokens: int) -> None:
         token_id = 0 if lora_id is None else int(lora_id)
         self._idx += [token_id] * num_tokens
         self._prompt.append(token_id)
-        self._is_prefill |= num_tokens > 1
+        self._use_prefill_routing &= num_tokens > 1
 
     def build(self) -> LoRAMapping:
-        return LoRAMapping(tuple(self._idx), tuple(self._prompt), self._is_prefill)
+        return LoRAMapping(
+            tuple(self._idx),
+            tuple(self._prompt),
+            self._use_prefill_routing,
+        )
 
     def is_empty(self) -> bool:
         return not self._idx

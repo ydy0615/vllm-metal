@@ -498,6 +498,38 @@ class TestV1SamplingBatch:
         assert result.token_ids[0] in [2, 3]
         assert result.token_ids[1] == 1  # unconstrained, should pick highest logit
 
+    def test_mixed_disabled_and_enabled_top_k(self) -> None:
+        """Mixed top_k=0 (disabled) and top_k=64 rows must not crash.
+
+        Regression for issue #646: the disabled row reached vLLM's sampler as
+        raw 0, which the PyTorch top-k path interprets as a gather index of
+        vocab_size (out of bounds). It must carry the vocab_size sentinel
+        instead, matching GPUInputBatch. Exercises the real Sampler.forward()
+        path via sample_from_logits (native greedy is unavailable for a mixed
+        batch).
+        """
+        top_k = 64
+        logits = mx.arange(2 * VOCAB_SIZE, dtype=mx.float32).reshape(2, VOCAB_SIZE)
+        batch = SamplingBatch(
+            [
+                SamplingParams(temperature=0.0),
+                SamplingParams(temperature=1.0, top_k=top_k, top_p=0.95),
+            ],
+            [[1], [2]],
+            [[], []],
+            vocab_size=VOCAB_SIZE,
+        )
+        # Disabled row must be normalized to the vocab_size sentinel.
+        metadata = batch.make_sampling_metadata()
+        assert metadata.top_k is not None
+        assert metadata.top_k.tolist() == [VOCAB_SIZE, top_k]
+
+        result = sample_from_logits(logits, batch, Sampler())
+        # Greedy row samples from the full vocab: argmax of row 0.
+        assert result.token_ids[0] == VOCAB_SIZE - 1
+        # Top-k row stays inside the top-64 candidates (values 960..1023).
+        assert VOCAB_SIZE - top_k <= result.token_ids[1] < VOCAB_SIZE
+
     def test_bad_words_blocks_greedy_token(self) -> None:
         """Greedy + bad_words_token_ids must fall back and block the banned token."""
         logits = mx.array([[10.0, 1.0, 5.0, 1.0]], dtype=mx.float32)
