@@ -261,7 +261,7 @@ def test_qlora_wrapper_no_lora_passthrough_with_punica() -> None:
     punica = PunicaWrapperMLX(max_num_batched_tokens=2, max_batches=1, max_loras=1)
     w.set_mapping(punica)
 
-    # no_lora=True (null mapping, all slots empty)
+    # no_lora=True because no adapter id maps to a resident slot.
     mapping = LoRAMapping(index_mapping=(0, 0), prompt_mapping=(0,))
     punica.update_metadata(mapping, lora_index_to_id=[None])
 
@@ -323,7 +323,7 @@ def test_qlora_mixed_batch_base_model_tokens_unaffected() -> None:
     b0 = rng.standard_normal((32, 1)).astype(np.float32)
     w.set_lora(0, mx.array(a0), mx.array(b0))
 
-    # Token 0 -> no-LoRA (null slot), tokens 1/2 -> adapter 55
+    # Token 0 -> no-LoRA, tokens 1/2 -> adapter 55.
     mapping = LoRAMapping(index_mapping=(0, 55, 55), prompt_mapping=(0, 55))
     punica.update_metadata(mapping, lora_index_to_id=[55])
 

@@ -66,9 +66,11 @@ class _LoRALinearBase(nn.Module):
         self.base_layer = base_layer
         self.max_loras, self.max_lora_rank = max_loras, max_lora_rank
         self.input_size, self.output_size = input_size, output_size
-        slots = max_loras + 1  # Trailing null slot; see punica_wrapper.
+        slots = max_loras + 1
         self.lora_a_stacked = mx.zeros((slots, max_lora_rank, input_size), dtype)
         self.lora_b_stacked = mx.zeros((slots, output_size, max_lora_rank), dtype)
+        # MLX tracks lists assigned through Module.__setattr__; ranks are metadata.
+        object.__setattr__(self, "_lora_ranks", [0] * slots)
         self.punica_wrapper: PunicaWrapperMLX | None = None
 
     def set_mapping(self, punica_wrapper: PunicaWrapperMLX) -> None:
@@ -120,14 +122,18 @@ class _LoRALinearBase(nn.Module):
 
     def set_lora(self, slot: int, lora_a: mx.array, lora_b: mx.array) -> None:
         prepared = self.prepare_lora_weights(slot, lora_a, lora_b)
-        self.set_prepared_lora(slot, *prepared)
+        self.set_prepared_lora(slot, *prepared, rank=int(lora_a.shape[0]))
 
-    def set_prepared_lora(self, slot: int, lora_a: mx.array, lora_b: mx.array) -> None:
+    def set_prepared_lora(
+        self, slot: int, lora_a: mx.array, lora_b: mx.array, *, rank: int
+    ) -> None:
         self.lora_a_stacked[slot], self.lora_b_stacked[slot] = lora_a, lora_b
+        self._lora_ranks[slot] = rank
 
     def reset_lora(self, slot: int) -> None:
         self.lora_a_stacked[slot] = mx.zeros_like(self.lora_a_stacked[slot])
         self.lora_b_stacked[slot] = mx.zeros_like(self.lora_b_stacked[slot])
+        self._lora_ranks[slot] = 0
 
 
 class MLXLinearWithLoRA(_LoRALinearBase):
@@ -165,7 +171,12 @@ class MLXLinearWithLoRA(_LoRALinearBase):
             else (x, y)
         )
         out = self.punica_wrapper.add_lora_linear(
-            y2, x2, self.lora_a_stacked, self.lora_b_stacked, scale=1.0
+            y2,
+            x2,
+            self.lora_a_stacked,
+            self.lora_b_stacked,
+            scale=1.0,
+            lora_ranks=self._lora_ranks,
         )
         return out if out is y else out.reshape(shape)
 
@@ -216,6 +227,7 @@ class MLXQuantizedLinearWithLoRA(_LoRALinearBase):
             self.lora_a_stacked,
             self.lora_b_stacked,
             scale=1.0,
+            lora_ranks=self._lora_ranks,
         )
         out = out.astype(y.dtype)
         return out if out.shape == shape else out.reshape(shape)
